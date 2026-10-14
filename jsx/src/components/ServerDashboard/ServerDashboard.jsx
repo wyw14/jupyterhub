@@ -1,4 +1,4 @@
-import React, { useEffect, useState, Fragment } from "react";
+import React, { useEffect, useRef, useState, Fragment } from "react";
 import { useSelector, useDispatch } from "react-redux";
 import { debounce } from "lodash";
 import PropTypes from "prop-types";
@@ -24,6 +24,14 @@ import { timeSince } from "../../util/timeSince";
 import { usePaginationParams } from "../../util/paginationParams";
 import PaginationFooter from "../PaginationFooter/PaginationFooter";
 
+// Stable identity for a user's server row.
+// The server name ("" for the default server) is the stable identifier
+// exposed by the API; unlike display_name or the transient user.server
+// running-marker it does not change between a write and the next read,
+// so per-row UI state is keyed by this instead of a mutable name/marker.
+const getServerRowId = (user, server) =>
+  `${user.name}\u0000${server.name || ""}`;
+
 const RowListItem = ({ text }) => (
   <span className="server-dashboard-row-list-item">{text}</span>
 );
@@ -37,6 +45,10 @@ const ServerDashboard = (props) => {
 
   const [errorAlert, setErrorAlert] = useState(null);
   const [collapseStates, setCollapseStates] = useState({});
+  // monotonically increasing id for list reads;
+  // only the most recently requested read may update the page,
+  // so out-of-order responses from concurrent updates are discarded
+  const latestListRequest = useRef(0);
 
   let user_data = useSelector((state) => state.user_data);
   const user_page = useSelector((state) => state.user_page);
@@ -123,44 +135,87 @@ const ServerDashboard = (props) => {
   // single callback to reload the page
   // uses current state
   const loadPageData = () => {
-    const abortHandle = { cancelled: false };
+    // every read gets a monotonically increasing request id;
+    // only the latest requested read is allowed to land,
+    // so out-of-order responses from concurrent reads/actions
+    // can never overwrite a newer, confirmed configuration
+    const requestId = ++latestListRequest.current;
     (async () => {
+      let data;
       try {
-        const data = await updateUsers({
+        data = await updateUsers({
           offset,
           limit,
           name_filter,
           sort,
           state: state_filter,
         });
-        // cancelled (e.g. param changed while waiting for response)
-        if (abortHandle.cancelled) return;
-        if (
-          data._pagination.offset &&
-          data._pagination.total <= data._pagination.offset
-        ) {
-          // reset offset if we're out of bounds,
-          // then load again
-          setOffset(0);
-          return;
-        }
-        // actually update page data
-        dispatchPageUpdate(data.items, data._pagination);
       } catch (e) {
-        console.error("Failed to update user list.", e);
-        setErrorAlert("Failed to update user list.");
+        // a failed read must not clear the last known-good list
+        if (requestId === latestListRequest.current) {
+          console.error("Failed to update user list.", e);
+          setErrorAlert("Failed to update user list.");
+        }
+        return;
       }
+      // a newer read was started while this one was in flight
+      if (requestId !== latestListRequest.current) return;
+      if (!data || !Array.isArray(data.items) || !data._pagination) {
+        // malformed/garbled response (e.g. an API error body):
+        // retain the currently held, still-valid list
+        console.error("Invalid user list response.", data);
+        setErrorAlert("Failed to update user list.");
+        return;
+      }
+      if (
+        data._pagination.offset &&
+        data._pagination.total <= data._pagination.offset
+      ) {
+        // reset offset if we're out of bounds,
+        // then load again
+        setOffset(0);
+        return;
+      }
+      // actually update page data
+      dispatchPageUpdate(data.items, data._pagination);
     })();
     // returns cancellation callback
     return () => {
-      // cancel stale load
-      abortHandle.cancelled = true;
+      // invalidate this and any older in-flight read
+      // (e.g. query params changed while waiting for the response)
+      if (latestListRequest.current === requestId) {
+        latestListRequest.current += 1;
+      }
     };
   };
 
   useEffect(() => {
     return loadPageData();
   }, [limit, name_filter, offset, sort, state_filter]);
+
+  // Revoke per-row UI state only when the server entry itself has
+  // disappeared (i.e. deleted). Renames and ordinary refreshes keep
+  // the same stable entry, so its state must be preserved.
+  useEffect(() => {
+    setCollapseStates((previous) => {
+      const validIds = new Set();
+      for (const user of user_data || []) {
+        for (const server of Object.values(user.servers || {})) {
+          validIds.add(getServerRowId(user, server));
+        }
+      }
+      const next = {};
+      let changed = false;
+      for (const [id, isOpen] of Object.entries(previous)) {
+        if (validIds.has(id)) {
+          next[id] = isOpen;
+        } else {
+          changed = true;
+        }
+      }
+      return changed ? next : previous;
+    });
+  }, [user_data]);
 
   if (!user_data || !user_page) {
     return <div data-testid="no-show"></div>;
@@ -393,7 +448,10 @@ const ServerDashboard = (props) => {
   const ServerRow = ({ user, server }) => {
     const serverNameDash = server.name ? `-${server.name}` : "";
     const userServerName = user.name + serverNameDash;
-    const open = collapseStates[userServerName] || false;
+    // per-row state is keyed by the stable server identity,
+    // not the display name or the running/default URL marker
+    const serverRowId = getServerRowId(user, server);
+    const open = collapseStates[serverRowId] || false;
     return (
       <Fragment key={`${userServerName}-row`}>
         <tr
@@ -407,7 +465,7 @@ const ServerDashboard = (props) => {
                 onClick={() =>
                   setCollapseStates({
                     ...collapseStates,
-                    [userServerName]: !open,
+                    [serverRowId]: !open,
                   })
                 }
                 aria-controls={`${userServerName}-collapse`}
@@ -478,12 +536,15 @@ const ServerDashboard = (props) => {
   };
 
   const serverRows = user_data.flatMap((user) => {
-    const userServers = Object.values({
-      // eslint-disable-next-line react/prop-types
-      "": user.server || {},
-      // eslint-disable-next-line react/prop-types
-      ...(user.servers || {}),
-    });
+    // Rows come only from the real servers map, keyed by the stable server
+    // name ("" is the default server) and always carrying the server model.
+    // Never synthesise a default row from the legacy user.server URL,
+    // which is just a running-marker that flips between URL and null
+    // between a write and the next read; that produced phantom rows for
+    // users with no servers at all or with only a named server, making
+    // the empty and single-server lists unstable.
+    // eslint-disable-next-line react/prop-types
+    const userServers = Object.values(user.servers || {});
     return userServers.map((server) => ServerRow({ user, server }));
   });
 
